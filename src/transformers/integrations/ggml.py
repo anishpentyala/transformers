@@ -43,6 +43,23 @@ GGUF_CONFIG_MAPPING = {
         "attention.layer_norm_rms_epsilon": "rms_norm_eps",
         "vocab_size": "vocab_size",
     },
+    "mixtral": {
+        # llama.cpp writes Mixtral checkpoints as the "llama" architecture
+        # with llama.* expert fields; after routing, keys are rewritten to
+        # the "mixtral" prefix (see modeling_gguf_pytorch_utils.py).
+        "context_length": "max_position_embeddings",
+        "block_count": "num_hidden_layers",
+        "feed_forward_length": "intermediate_size",
+        "embedding_length": "hidden_size",
+        "rope.dimension_count": "head_dim",
+        "rope.freq_base": "rope_theta",
+        "attention.head_count": "num_attention_heads",
+        "attention.head_count_kv": "num_key_value_heads",
+        "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+        "vocab_size": "vocab_size",
+        "expert_count": "num_local_experts",
+        "expert_used_count": "num_experts_per_tok",
+    },
     "mistral": {
         "context_length": "max_position_embeddings",
         "block_count": "num_hidden_layers",
@@ -54,6 +71,7 @@ GGUF_CONFIG_MAPPING = {
         "attention.head_count": "num_attention_heads",
         "attention.head_count_kv": "num_key_value_heads",
         "attention.layer_norm_rms_epsilon": "rms_norm_eps",
+        "attention.sliding_window": "sliding_window",
         "vocab_size": "vocab_size",
     },
     "qwen2": {
@@ -117,6 +135,7 @@ GGUF_CONFIG_MAPPING = {
         "embedding_length": "hidden_size",
         "rope.dimension_count": None,
         "rope.freq_base": "rope_theta",
+        "attention.key_length": "head_dim",
         "attention.head_count": "num_attention_heads",
         "attention.head_count_kv": "num_key_value_heads",
         "attention.layer_norm_rms_epsilon": "rms_norm_eps",
