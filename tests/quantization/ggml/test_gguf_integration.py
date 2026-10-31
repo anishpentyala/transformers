@@ -579,3 +579,159 @@ class GemmaGgufTokenizerTest(GgufTokenizerTesterMixin, unittest.TestCase):
     gguf_repo = "unsloth/gemma-3-1b-it-GGUF"
     quantized_gguf_file = "gemma-3-1b-it-Q4_K_M.gguf"
     reference_repo = "google/gemma-3-1b-it"
+
+
+class GgufSyntheticArchRoutingTest(unittest.TestCase):
+    """Routing of GGUF architecture metadata to the right HF config/processor.
+
+    These build tiny synthetic files with gguf-py instead of downloading real
+    checkpoints, so they exercise the exact field combinations from
+    https://github.com/huggingface/transformers/issues/50197 without needing
+    multi-GB fixtures.
+    """
+
+    def _write_gguf(self, path, arch, fields, tensors, name=None):
+        from gguf import GGUFWriter
+
+        writer = GGUFWriter(path, arch)
+        for key, value in fields.items():
+            writer.add_uint32(key, value)
+        if name is not None:
+            writer.add_string("general.name", name)
+        import numpy as np
+        from gguf import GGMLQuantizationType
+
+        for name, array in tensors.items():
+            writer.add_tensor(name, np.asarray(array, dtype=np.float32), raw_dtype=GGMLQuantizationType.F32)
+        writer.write_header_to_file()
+        writer.write_kv_data_to_file()
+        writer.write_tensors_to_file()
+        writer.close()
+
+    def _load_config(self, path):
+        from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
+
+        return load_gguf_checkpoint(path)["config"]
+
+    @require_gguf
+    def test_llama_with_expert_fields_routes_to_mixtral(self):
+        import numpy as np
+        import torch
+
+        from transformers import MixtralConfig, MixtralForCausalLM
+        from transformers.modeling_gguf_pytorch_utils import load_gguf_checkpoint
+
+        num_experts, hidden, ffn = 2, 8, 16
+        rng = np.random.default_rng(0)
+        tensors = {
+            # llama.cpp layout: expert axis first in numpy order
+            "blk.0.ffn_gate_exps.weight": rng.normal(size=(num_experts, ffn, hidden)).astype(np.float32),
+            "blk.0.ffn_up_exps.weight": rng.normal(size=(num_experts, ffn, hidden)).astype(np.float32),
+            "blk.0.ffn_down_exps.weight": rng.normal(size=(num_experts, hidden, ffn)).astype(np.float32),
+            "blk.0.ffn_gate_inp.weight": rng.normal(size=(num_experts, hidden)).astype(np.float32),
+        }
+        fields = {
+            "llama.expert_count": num_experts,
+            "llama.expert_used_count": 1,
+            "llama.context_length": 32,
+            "llama.block_count": 1,
+            "llama.feed_forward_length": ffn,
+            "llama.embedding_length": hidden,
+            "llama.attention.head_count": 1,
+            "llama.attention.head_count_kv": 1,
+            "llama.vocab_size": 32,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/tiny-mixtral.gguf"
+            self._write_gguf(path, "llama", fields, tensors)
+
+            config = self._load_config(path)
+            # Without the routing, this parses as a dense `llama` config and
+            # the expert tensors are dropped, leaving randomly initialized MLPs.
+            self.assertEqual(config["model_type"], "mixtral")
+            self.assertEqual(config["num_local_experts"], num_experts)
+            self.assertEqual(config["num_experts_per_tok"], 1)
+
+            model_config = MixtralConfig(**{k: v for k, v in config.items() if k != "model_type"})
+            model = MixtralForCausalLM(model_config)
+            parsed = load_gguf_checkpoint(path, return_tensors=True, model_to_load=model)
+
+            gate_up = parsed["tensors"]["model.layers.0.mlp.experts.gate_up_proj"]
+            self.assertEqual(tuple(gate_up.shape), (num_experts, 2 * ffn, hidden))
+            # HF consumes gate_up_proj[e].chunk(2, dim=-1) as (w1, w3)
+            self.assertTrue(torch.allclose(gate_up[:, :ffn], torch.from_numpy(tensors["blk.0.ffn_gate_exps.weight"])))
+            self.assertTrue(torch.allclose(gate_up[:, ffn:], torch.from_numpy(tensors["blk.0.ffn_up_exps.weight"])))
+            self.assertTrue(
+                torch.allclose(
+                    parsed["tensors"]["model.layers.0.mlp.experts.down_proj"],
+                    torch.from_numpy(tensors["blk.0.ffn_down_exps.weight"]),
+                )
+            )
+            self.assertTrue(
+                torch.allclose(
+                    parsed["tensors"]["model.layers.0.mlp.gate.weight"],
+                    torch.from_numpy(tensors["blk.0.ffn_gate_inp.weight"]),
+                )
+            )
+
+    @require_gguf
+    def test_llama_without_expert_fields_stays_llama(self):
+        fields = {
+            "llama.context_length": 32,
+            "llama.block_count": 1,
+            "llama.feed_forward_length": 16,
+            "llama.embedding_length": 8,
+            "llama.attention.head_count": 1,
+            "llama.attention.head_count_kv": 1,
+            "llama.vocab_size": 32,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/tiny-llama.gguf"
+            self._write_gguf(path, "llama", fields, {})
+            config = self._load_config(path)
+            self.assertEqual(config["model_type"], "llama")
+            self.assertNotIn("num_local_experts", config)
+
+    @require_gguf
+    def test_converted_mistral_name_detected_case_insensitively(self):
+        fields = {
+            "llama.context_length": 32,
+            "llama.block_count": 1,
+            "llama.feed_forward_length": 16,
+            "llama.embedding_length": 8,
+            "llama.attention.head_count": 1,
+            "llama.attention.head_count_kv": 1,
+            "llama.attention.sliding_window": 256,
+            "llama.vocab_size": 32,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/tiny-mistral.gguf"
+            # A converted checkpoint carries its model name, not the bare
+            # string "mistral" (the only value the previous list-membership
+            # check matched).
+            self._write_gguf(path, "llama", fields, {}, name="Mistral-7B-v0.1")
+
+            config = self._load_config(path)
+            self.assertEqual(config["model_type"], "mistral")
+            self.assertEqual(config["sliding_window"], 256)
+
+    @require_gguf
+    def test_qwen3_key_length_maps_to_head_dim(self):
+        fields = {
+            "qwen3.context_length": 32,
+            "qwen3.block_count": 1,
+            "qwen3.feed_forward_length": 16,
+            "qwen3.embedding_length": 8,
+            "qwen3.attention.head_count": 1,
+            "qwen3.attention.head_count_kv": 1,
+            "qwen3.attention.key_length": 64,
+            "qwen3.vocab_size": 32,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = f"{tmpdir}/tiny-qwen3.gguf"
+            self._write_gguf(path, "qwen3", fields, {})
+            config = self._load_config(path)
+            self.assertEqual(config["model_type"], "qwen3")
+            # Without the mapping, head_dim falls back to Qwen3Config's
+            # default 128 and the first forward fails.
+            self.assertEqual(config["head_dim"], 64)
