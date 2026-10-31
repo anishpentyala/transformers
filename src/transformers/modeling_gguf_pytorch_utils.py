@@ -84,6 +84,31 @@ class TensorProcessor:
     def process(self, weights, name, **kwargs):
         return GGUFTensor(weights, name, {})
 
+    def _set_moe_expert_tensor(self, weights: np.ndarray, parsed_parameters: dict[str, dict], hf_name: str, w: str):
+        """Merge one `blk.N.ffn_{gate,up,down}_exps` GGUF tensor into the HF
+        merged expert weight `hf_name` (expert axis first in numpy order for
+        both layouts). Gate (w1) and up (w3) are concatenated along dim 1 of
+        the merged `gate_up_proj` - w1 first, w3 second - which is what the HF
+        MoE modules consume via `chunk(2, dim=-1)`.
+        ref: https://github.com/vllm-project/vllm/blob/8f8fda261a620234fdeea338f44093d5d8072879/vllm/model_executor/layers/fused_moe/layer.py#L988-L1015
+        """
+        torch_weights = torch.from_numpy(np.copy(weights))
+        if w == "down":
+            parsed_parameters["tensors"][hf_name] = torch_weights
+        else:
+            shape = list(weights.shape)
+            shard_dim = 1
+            shard_size = shape[shard_dim]
+            shape[shard_dim] = shard_size * 2
+            if hf_name not in parsed_parameters["tensors"]:
+                parsed_parameters["tensors"][hf_name] = torch.zeros(shape, dtype=torch_weights.dtype)
+            out: torch.Tensor = parsed_parameters["tensors"][hf_name]
+            if w == "gate":
+                out = out.narrow(shard_dim, 0, shard_size)
+            else:  # w == "up"
+                out = out.narrow(shard_dim, shard_size, shard_size)
+            out.copy_(torch_weights)
+
 
 class LlamaTensorProcessor(TensorProcessor):
     def __init__(self, config=None):
@@ -113,6 +138,41 @@ class LlamaTensorProcessor(TensorProcessor):
         dim = weights.shape[0] // n_head // 2
         w = weights.reshape(n_head, dim, 2, *weights.shape[1:])
         return w.swapaxes(2, 1).reshape(weights.shape)
+
+
+class MixtralTensorProcessor(LlamaTensorProcessor):
+    """Processor for llama.cpp Mixtral checkpoints.
+
+    llama.cpp writes Mixtral as the `llama` architecture plus `llama.expert_*`
+    metadata and merged `blk.N.ffn_{gate,up,down}_exps` / `ffn_gate_inp`
+    tensors. The config routing in `load_gguf_checkpoint` maps those files to
+    the `mixtral` model type; this processor merges the expert tensors into
+    HF's per-layer `experts.gate_up_proj` / `experts.down_proj` layout and
+    inherits the llama-family attention permute from `LlamaTensorProcessor`.
+    """
+
+    HF_MOE_GATE_UP_PATTERN = re.compile(r"model\.layers\.(?P<bid>\d+)\.mlp\.experts\.gate_up_proj")
+    HF_MOE_DOWN_PATTERN = re.compile(r"model\.layers\.(?P<bid>\d+)\.mlp\.experts\.down_proj")
+    GGUF_MOE_WEIGHTS_PATTERN = re.compile(r"(?P<name>.*\.ffn_(?P<w>gate|down|up)_exps)\.weight$")
+
+    def perform_fallback_tensor_mapping(
+        self, gguf_to_hf_name_map: dict[str, str], suffix: str, qual_name: str, hf_name: str
+    ):
+        if m := re.fullmatch(self.HF_MOE_GATE_UP_PATTERN, hf_name):
+            full_hf_name = qual_name + hf_name
+            gguf_to_hf_name_map[f"blk.{m['bid']}.ffn_gate_exps{suffix}"] = full_hf_name
+            gguf_to_hf_name_map[f"blk.{m['bid']}.ffn_up_exps{suffix}"] = full_hf_name
+        elif m := re.fullmatch(self.HF_MOE_DOWN_PATTERN, hf_name):
+            gguf_to_hf_name_map[f"blk.{m['bid']}.ffn_down_exps{suffix}"] = qual_name + hf_name
+
+    def process(self, weights, name: str, **kwargs):
+        if m := re.fullmatch(self.GGUF_MOE_WEIGHTS_PATTERN, name):
+            tensor_key_mapping = kwargs.get("tensor_key_mapping")
+            parsed_parameters = kwargs.get("parsed_parameters")
+            if tensor_key_mapping:
+                self._set_moe_expert_tensor(weights, parsed_parameters, tensor_key_mapping[m["name"]], m["w"])
+                return GGUFTensor(weights, None, {})
+        return super().process(weights, name, **kwargs)
 
 
 class Qwen2MoeTensorProcessor(TensorProcessor):
@@ -147,28 +207,6 @@ class Qwen2MoeTensorProcessor(TensorProcessor):
             # quantized one is (2048)
             weights = np.expand_dims(weights, axis=0)
         return GGUFTensor(weights, name, {})
-
-    def _set_moe_expert_tensor(self, weights: np.ndarray, parsed_parameters: dict[str, dict], hf_name: str, w: str):
-        torch_weights = torch.from_numpy(np.copy(weights))
-        if w == "down":
-            parsed_parameters["tensors"][hf_name] = torch_weights
-        else:
-            # Double the size of the second dimension to interleave w1 (gate) and w3 (up)
-            # weights per expert (which is the first dimension).
-            # w1 (gate) comes first and w3 (up) comes second.
-            # ref: https://github.com/vllm-project/vllm/blob/8f8fda261a620234fdeea338f44093d5d8072879/vllm/model_executor/layers/fused_moe/layer.py#L988-L1015
-            shape = list(weights.shape)
-            shard_dim = 1
-            shard_size = shape[shard_dim]
-            shape[shard_dim] = shard_size * 2
-            if hf_name not in parsed_parameters["tensors"]:
-                parsed_parameters["tensors"][hf_name] = torch.zeros(shape, dtype=torch_weights.dtype)
-            out: torch.Tensor = parsed_parameters["tensors"][hf_name]
-            if w == "gate":
-                out = out.narrow(shard_dim, 0, shard_size)
-            else:  # w == "up"
-                out = out.narrow(shard_dim, shard_size, shard_size)
-            out.copy_(torch_weights)
 
 
 class GptOssTensorProcessor(TensorProcessor):
@@ -455,6 +493,7 @@ class MiniMaxM2TensorProcessor(TensorProcessor):
 
 TENSOR_PROCESSORS = {
     "llama": LlamaTensorProcessor,
+    "mixtral": MixtralTensorProcessor,
     "qwen2moe": Qwen2MoeTensorProcessor,
     "gpt_oss": GptOssTensorProcessor,
     "qwen3moe": Qwen2MoeTensorProcessor,
@@ -522,6 +561,10 @@ def get_gguf_hf_weights_map(
         model_type = "minimax-m2"
     elif model_type == "gpt_oss":
         model_type = "gpt-oss"
+    elif model_type in ("mixtral", "mistral"):
+        # llama.cpp writes Mixtral/Mistral checkpoints with the `llama`
+        # architecture, and gguf-py has no separate mixtral/mistral arch.
+        model_type = "llama"
     arch = None
     for key, value in MODEL_ARCH_NAMES.items():
         if value == model_type:
@@ -609,7 +652,7 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
     updated_architecture = None
     # in llama.cpp mistral models use the same architecture as llama. We need
     # to add this patch to ensure things work correctly on our side.
-    if "llama" in architecture and "mistral" in model_name:
+    if "llama" in architecture and model_name and "mistral" in model_name[0].lower():
         updated_architecture = "mistral"
     # FIXME: Currently this implementation is only for flan-t5 architecture.
     # It needs to be developed for supporting legacy t5.
@@ -625,6 +668,14 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
             updated_architecture = "t5"
     else:
         updated_architecture = architecture
+
+    # llama.cpp writes Mixtral checkpoints as the `llama` architecture plus
+    # `llama.expert_count` metadata and merged expert tensors; route those to
+    # the Mixtral config instead of building a dense LlamaConfig whose MLPs
+    # have no matching weights (and would be silently re-initialized).
+    expert_count = read_field(reader, "llama.expert_count")
+    if updated_architecture == "llama" and expert_count and expert_count[0] > 0:
+        updated_architecture = "mixtral"
 
     if "qwen2moe" in architecture:
         updated_architecture = "qwen2_moe"
@@ -781,7 +832,9 @@ def load_gguf_checkpoint(gguf_checkpoint_path, return_tensors=False, model_to_lo
 
         config = parsed_parameters.get("config", {})
 
-        ProcessorClass = TENSOR_PROCESSORS.get(architecture, TensorProcessor)
+        ProcessorClass = TENSOR_PROCESSORS.get(
+            updated_architecture, TENSOR_PROCESSORS.get(architecture, TensorProcessor)
+        )
         processor = ProcessorClass(config=config)
 
         tensor_key_mapping = get_gguf_hf_weights_map(model_to_load, processor)
